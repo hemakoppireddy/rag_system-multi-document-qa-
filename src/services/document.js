@@ -1,7 +1,12 @@
 import fs from 'fs';
 import path from 'path';
-import pdfParse from 'pdf-parse';
 import mammoth from 'mammoth';
+import * as pdfjsModule from 'pdfjs-dist/legacy/build/pdf.js';
+
+const getDocumentFn =
+  pdfjsModule.getDocument ||
+  pdfjsModule.default?.getDocument ||
+  (pdfjsModule.default && pdfjsModule.default.default?.getDocument);
 
 /**
  * Validates whether the uploaded file format is supported.
@@ -32,53 +37,43 @@ export async function parsePdf(source) {
     dataBuffer = source;
   }
 
-  const pages = [];
+  const uint8Array = new Uint8Array(dataBuffer);
 
-  // Custom page renderer to capture page-by-page text
-  const customPageRender = (pageData) => {
-    return pageData.getTextContent().then((textContent) => {
-      let lastY, text = '';
-      for (const item of textContent.items) {
-        if (lastY === item.transform[5] || !lastY) {
-          text += item.str;
-        } else {
-          text += '\n' + item.str;
-        }
-        lastY = item.transform[5];
-      }
+  const getDoc = getDocumentFn || pdfjsModule.getDocument || pdfjsModule.default?.getDocument;
+  if (typeof getDoc !== 'function') {
+    throw new Error('PDF.js getDocument function could not be loaded.');
+  }
 
-      const cleanText = text.trim();
-      const pageNumber = pageData.pageIndex + 1; // 1-indexed
-      pages.push({
-        pageNumber,
-        text: cleanText,
-      });
-
-      return cleanText;
-    });
-  };
-
-  const parsed = await pdfParse(dataBuffer, {
-    pagerender: customPageRender,
+  const loadingTask = getDoc({
+    data: uint8Array,
+    disableFontFace: true,
+    isEvalSupported: false,
+    useSystemFonts: true,
   });
 
-  // Sort pages by page number in case of async ordering
-  pages.sort((a, b) => a.pageNumber - b.pageNumber);
+  const doc = await loadingTask.promise;
+  const numPages = doc.numPages;
+  const pages = [];
+  const allText = [];
 
-  // If for any reason custom renderer didn't capture pages (e.g. single page or empty), fallback
-  if (pages.length === 0) {
-    const fullText = (parsed.text || '').trim();
+  for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+    const page = await doc.getPage(pageNum);
+    const textContent = await page.getTextContent();
+
+    const items = textContent.items || [];
+    let pageText = items.map((item) => item.str || '').join(' ').replace(/\s+/g, ' ').trim();
+
     pages.push({
-      pageNumber: 1,
-      text: fullText,
+      pageNumber: pageNum,
+      text: pageText,
     });
+    allText.push(pageText);
   }
 
   return {
-    text: parsed.text || pages.map((p) => p.text).join('\n\n'),
+    text: allText.join('\n\n'),
     pages,
-    pageCount: parsed.numpages || pages.length,
-    info: parsed.info || {},
+    pageCount: numPages,
   };
 }
 
@@ -98,9 +93,7 @@ export async function parseDocx(source) {
   const result = await mammoth.extractRawText({ buffer });
   const rawText = (result.value || '').trim();
 
-  // DOCX files do not have explicit pagination metadata in raw format.
-  // We segment the text into logical blocks / estimated pages (~1500 chars / paragraph groups)
-  // while preserving sequential block indexing as fallback page numbers.
+  // DOCX segmentation into logical blocks / estimated pages
   const paragraphs = rawText.split(/\n\s*\n/).filter((p) => p.trim().length > 0);
   const pages = [];
 
